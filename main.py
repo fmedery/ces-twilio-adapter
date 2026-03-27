@@ -352,7 +352,11 @@ async def websocket_endpoint(websocket: WebSocket):
             nonlocal called_number
             nonlocal va_ws
             while True:
-                message = await websocket.receive_text()
+                try:
+                    message = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    logger.info("Twilio websocket disconnected.")
+                    break
                 data = json.loads(message)
                 event_type = data.get("event")
 
@@ -430,8 +434,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                     "Flushing token cache."
                                 )
                                 flush_token_cache()
-                            # Re-raise to let the main loop handle connection closing
-                            raise
+                            logger.warning(f"VA connection closed during config send: {e}")
+                            break
 
                         # Send initial message
                         kickstart_text = "Hi!"
@@ -445,11 +449,15 @@ async def websocket_endpoint(websocket: WebSocket):
                             f"Sending initial message to virtual agent: "
                             f"{kickstart_message}"
                         )
-                        await va_ws.send(json.dumps(kickstart_message))
-                        logger.info(
-                            f"-> Sent initial message to virtual agent: "
-                            f"{kickstart_message}"
-                        )
+                        try:
+                            await va_ws.send(json.dumps(kickstart_message))
+                            logger.info(
+                                f"-> Sent initial message to virtual agent: "
+                                f"{kickstart_message}"
+                            )
+                        except websockets.exceptions.ConnectionClosed as e:
+                            logger.warning(f"VA connection closed during init message send: {e}")
+                            break
                     else:
                         logger.warning(f"Malformed start event from Twilio: {data}")
 
@@ -476,7 +484,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             resampled_linear_audio
                         ).decode("utf-8")
                         va_input = {"realtimeInput": {"audio": base64_pcm_payload}}
-                        await va_ws.send(json.dumps(va_input))
+                        try:
+                            await va_ws.send(json.dumps(va_input))
+                        except websockets.exceptions.ConnectionClosed as e:
+                            logger.warning(f"VA connection closed during audio send: {e}")
+                            break
                     else:
                         logger.warning(f"Malformed media event from Twilio: {data}")
 
@@ -503,7 +515,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 "VA WebSocket is ready, starting to forward messages from VA to Twilio."
             )
             while True:
-                va_response = await va_ws.recv()
+                try:
+                    va_response = await va_ws.recv()
+                except websockets.exceptions.ConnectionClosed as e:
+                    logger.warning(f"VA connection closed during recv: {e}")
+                    break
                 logger.debug(f"<- Received from virtual agent: {va_response}")
                 va_data = json.loads(va_response)
                 if "sessionOutput" in va_data:
@@ -542,15 +558,17 @@ async def websocket_endpoint(websocket: WebSocket):
                             "streamSid": stream_sid,
                             "media": {"payload": encoded_va_audio, "track": "outbound"},
                         }
-                        await websocket.send_text(json.dumps(response_media_message))
+                        try:
+                            await websocket.send_text(json.dumps(response_media_message))
+                        except WebSocketDisconnect:
+                            logger.warning("Twilio websocket disconnected during send.")
+                            break
                     else:
                         logger.debug(
                             f"Invalid or unknown sessionOutput from VA: {va_data}"
                         )
                 elif "endSession" in va_data:
                     logger.info("VA has ended the session. Closing connections.")
-                    await va_ws.close()
-                    await websocket.close()
                     break
                 else:
                     logger.debug(f"Invalid or unknown message from VA: {va_data}")
@@ -567,24 +585,42 @@ async def websocket_endpoint(websocket: WebSocket):
         for task in pending:
             task.cancel()
         for task in done:
-            if task.exception():
-                # Log the full traceback of the exception from the task.
-                logger.error(
-                    "Task finished with an exception", exc_info=task.exception()
-                )
+            exc = task.exception()
+            if exc:
+                if isinstance(exc, (websockets.exceptions.ConnectionClosed, WebSocketDisconnect)):
+                    logger.info(f"Task finished with connection closed: {exc}")
+                else:
+                    logger.error(
+                        "Task finished with an exception", exc_info=exc
+                    )
 
     except WebSocketDisconnect:
         logger.warning("WebSocket disconnected by the remote end (Twilio).")
     except websockets.exceptions.ConnectionClosed as e:
-        # Log the full traceback for connection closed errors.
-        logger.error(f"Connection to virtual agent closed: {e}", exc_info=True)
+        logger.warning(f"Connection to virtual agent closed: {e}")
     except Exception as e:
         logger.error(f"An unexpected WebSocket error occurred: {e}", exc_info=True)
     finally:
-        if va_ws and va_ws.state != WebsocketProtocolState.CLOSED:
-            await va_ws.close()
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close()
+        if va_ws:
+            try:
+                if va_ws.state != WebsocketProtocolState.CLOSED:
+                    await va_ws.close()
+            except Exception as e:
+                logger.debug(f"Error closing VA websocket: {e}")
+
+        try:
+            # We check if the socket is already closed or closing to avoid RuntimeError
+            if (
+                websocket.client_state != WebSocketState.DISCONNECTED
+                and websocket.application_state != WebSocketState.DISCONNECTED
+            ):
+                await websocket.close()
+        except RuntimeError:
+            # Already closed or in a state where we can't send a close frame
+            pass
+        except Exception as e:
+            logger.debug(f"Error closing Twilio websocket: {e}")
+            
         logger.info("All WebSocket connections closed.")
 
 
