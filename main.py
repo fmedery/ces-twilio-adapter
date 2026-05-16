@@ -382,17 +382,19 @@ async def websocket_endpoint(websocket: WebSocket):
                             "virtual_agent_endpoint"
                         )
 
-                        # Extract new user data parameters defensively
-                        extracted_params = {}
-                        for key in [
-                            "first_name",
-                            "last_name",
-                            "insurance_advisor",
-                            "insurance_type",
-                        ]:
-                            val = custom_parameters.get(key)
-                            if val is not None:
-                                extracted_params[key] = val
+                        # Extract custom parameters dynamically, excluding internal ones
+                        internal_keys = {
+                            "session_id",
+                            "deployment_id",
+                            "virtual_agent_endpoint",
+                            "caller_id",
+                            "called_number",
+                        }
+                        extracted_params = {
+                            k: v
+                            for k, v in custom_parameters.items()
+                            if k not in internal_keys
+                        }
 
                         project_id = get_project_id_from_session_id(session_id)
                         logger.info(
