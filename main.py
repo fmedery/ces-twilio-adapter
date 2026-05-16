@@ -136,7 +136,9 @@ def get_project_id_from_session_id(session_id: str) -> str:
             )
 
 
-def get_config_message(session_id: str, deployment_id: str | None = None) -> dict:
+def get_config_message(
+    session_id: str, deployment_id: str | None = None, custom_params: dict | None = None
+) -> dict:
     """Builds the configuration message for the virtual agent."""
     config_message = {
         "config": {
@@ -153,6 +155,11 @@ def get_config_message(session_id: str, deployment_id: str | None = None) -> dic
     }
     if deployment_id:
         config_message["config"]["deployment"] = deployment_id
+
+    if custom_params:
+        # Inject custom parameters into the session configuration
+        config_message["config"]["clientContext"] = custom_params
+
     return config_message
 
 
@@ -353,13 +360,27 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif event_type == "start":
                     if "start" in data and "streamSid" in data["start"]:
                         stream_sid = data["start"]["streamSid"]
-                        session_id = data["start"]["customParameters"].get("session_id")
-                        deployment_id = data["start"]["customParameters"].get(
-                            "deployment_id"
-                        )
-                        virtual_agent_url = data["start"]["customParameters"].get(
+                        custom_parameters = data["start"].get("customParameters", {})
+                        session_id = custom_parameters.get("session_id")
+                        deployment_id = custom_parameters.get("deployment_id")
+                        virtual_agent_url = custom_parameters.get(
                             "virtual_agent_endpoint"
                         )
+
+                        # Extract custom parameters dynamically, excluding internal ones
+                        internal_keys = {
+                            "session_id",
+                            "deployment_id",
+                            "virtual_agent_endpoint",
+                            "caller_id",
+                            "called_number",
+                        }
+                        extracted_params = {
+                            k: v
+                            for k, v in custom_parameters.items()
+                            if k not in internal_keys
+                        }
+
                         project_id = get_project_id_from_session_id(session_id)
                         logger.info(
                             f"Twilio Start. Stream SID: {stream_sid}, Call SID: "
@@ -401,7 +422,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         va_ws_ready.set()
 
                         # Send config message
-                        config_message = get_config_message(session_id, deployment_id)
+                        config_message = get_config_message(
+                            session_id,
+                            deployment_id,
+                            custom_params=extracted_params if extracted_params else None,
+                        )
                         logger.info(
                             f"Sending config to virtual agent: {config_message}"
                         )
